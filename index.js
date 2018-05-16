@@ -615,7 +615,7 @@ Client.prototype.busyP = function () {
   return busyP
 }
 
-Client.prototype.publisherTimestamp = function (callback) {
+Client.prototype.publisherTimestamp = function (callback, updateList) {
   const self = this
 
   let path
@@ -627,7 +627,7 @@ Client.prototype.publisherTimestamp = function (callback) {
     self._log('publisherInfo', { method: 'GET', path: path, errP: !!err })
     if (err) return callback(err)
 
-    callback(null, body)
+    callback(null, body, updateList)
   })
 }
 

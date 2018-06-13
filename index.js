@@ -177,15 +177,6 @@ Client.prototype.sync = function (callback) {
     } catch (ex) {}
   }
 
-  if (self.state.updatesStamp < now) {
-    return self._updateRules(function (err) {
-      if (err) self._log('_updateRules', { message: err.toString() })
-
-      self._log('sync', { delayTime: msecs.minute })
-      callback(null, self.state, msecs.minute)
-    })
-  }
-
   if (!self.credentials) self.credentials = {}
 
   if (!self.state.persona) return self._registerPersona(callback)
@@ -998,13 +989,6 @@ Client.prototype._currentReconcile = function (callback) {
 
         self.state.reconcileStamp = underscore.now() + (self.state.properties.days * msecs.day)
         if (self.options.verboseP) self.state.reconcileDate = new Date(self.state.reconcileStamp)
-
-        self._updateRules(function (err) {
-          if (err) self._log('_updateRules', { message: err.toString() })
-
-          self._log('_currentReconcile', { delayTime: msecs.minute })
-          callback(null, self.state, msecs.minute)
-        })
       })
     }
 

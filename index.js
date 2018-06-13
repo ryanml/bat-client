@@ -20,6 +20,7 @@ const uuid = require('uuid')
 const batPublisher = require('bat-publisher')
 
 const SEED_LENGTH = 32
+const BATCH_SIZE = 10
 const HKDF_SALT = new Uint8Array([ 126, 244, 99, 158, 51, 68, 253, 80, 133, 183, 51, 180, 77, 62, 74, 252, 62, 106, 96, 125, 241, 110, 134, 87, 190, 208, 158, 84, 125, 69, 246, 207, 162, 247, 107, 172, 37, 34, 53, 246, 105, 20, 215, 5, 248, 154, 179, 191, 46, 17, 6, 72, 210, 91, 10, 169, 145, 248, 22, 147, 117, 24, 105, 12 ])
 const LEDGER_SERVERS = {
   'staging': {
@@ -41,7 +42,7 @@ const Client = function (personaId, options, state) {
   const later = now + (15 * msecs.minute)
 
   self.options = underscore.defaults(underscore.clone(options || {}),
-                                     { version: 'v1', debugP: false, loggingP: false, verboseP: false })
+      { version: 'v1', debugP: false, loggingP: false, verboseP: false })
 
   const env = self.options.environment || 'production'
   const version = self.options.version || 'v2'
@@ -76,7 +77,7 @@ const Client = function (personaId, options, state) {
 
     state.properties.wallet.keyinfo.seed = seed
   }
-  self.state = underscore.defaults(state || {}, { personaId: personaId, options: self.options, ballots: [], transactions: [] })
+  self.state = underscore.defaults(state || {}, { personaId: personaId, options: self.options, ballots: [], batch: {}, transactions: [] })
   self.logging = []
 
   if (self.options.rulesTestP) {
@@ -192,18 +193,50 @@ Client.prototype.sync = function (callback) {
 
   if (self.options.verboseP) console.log('+++ busyP=' + self.busyP())
 
-  ballots = underscore.shuffle(self.state.ballots)
-  for (i = ballots.length - 1; i >= 0; i--) {
-    ballot = ballots[i]
-    transaction = underscore.find(self.state.transactions, function (transaction) {
-      return ((transaction.credential) &&
-              (ballot.viewingId === transaction.viewingId) &&
-              ((!ballot.prepareBallot) || (!ballot.delayStamp) || (ballot.delayStamp <= now)))
-    })
-    if (!transaction) continue
+  ballots = self.state.ballots
+  if (ballots && ballots.length > 0) {
+    ballots = underscore.shuffle(ballots)
 
-    if (!ballot.prepareBallot) return self._prepareBallot(ballot, transaction, callback)
-    return self._commitBallot(ballot, transaction, callback)
+    let prepareTransaction = null
+    const batchProof = []
+    const transactions = self.state.transactions
+    ballots.every(ballot => {
+      if (ballot.prepareBallot && ballot.proofBallot) return true
+
+      const transaction = transactions.find(transaction => {
+        return transaction.credential && ballot.viewingId === transaction.viewingId
+      })
+
+      if (!transaction) return true
+
+      if (!ballot.prepareBallot) {
+        prepareTransaction = transaction
+        return false
+      }
+
+      batchProof.push({
+        transaction,
+        ballot
+      })
+
+      return true
+    })
+
+    if (prepareTransaction) {
+      return self._prepareBatch(prepareTransaction, callback)
+    }
+
+    if (batchProof.length > 0) {
+      return self._proofBatch(batchProof, callback)
+    }
+  }
+
+  if (ballots && ballots.length > 0 && (!self.state.batch || Object.keys(self.state.batch).length === 0)) {
+    return self._prepareVoteBatch(callback)
+  }
+
+  if (self.state.batch && Object.keys(self.state.batch).length > 0) {
+    return self._voteBatch(callback)
   }
 
   transaction = underscore.find(self.state.transactions, function (transaction) {
@@ -431,7 +464,7 @@ Client.prototype.reconcile = function (viewingId, callback) {
 
       delayTime = random.randomInt({ min: msecs.second, max: (self.options.debugP ? 1 : 10) * msecs.minute })
       self._log('reconcile',
-                { reason: 'awaiting a new surveyorId', delayTime: delayTime, surveyorId: surveyorInfo.surveyorId })
+          { reason: 'awaiting a new surveyorId', delayTime: delayTime, surveyorId: surveyorInfo.surveyorId })
       return callback(null, null, delayTime)
     }
 
@@ -752,7 +785,7 @@ Client.prototype.getPromotion = function (lang, forPaymentId, callback) {
   })
 }
 
-Client.prototype.setPromotion = function (promotionId, callback) {
+Client.prototype.setPromotion = function (promotionId, captchaResponse, callback) {
   const self = this
 
   let path
@@ -760,8 +793,20 @@ Client.prototype.setPromotion = function (promotionId, callback) {
   if (self.options.version === 'v1') return
 
   path = '/v1/grants/' + self.state.properties.wallet.paymentId
-  self._retryTrip(self, { path: path, method: 'PUT', payload: { promotionId: promotionId } }, function (err, response, body) {
-    self._log('publisherInfo', { method: 'PUT', path: path, errP: !!err })
+  self._retryTrip(self, { path: path, method: 'PUT', payload: { promotionId, captchaResponse } }, function (err, response, body) {
+    self._log('setPromotion', { method: 'PUT', path: path, errP: !!err })
+    if (err) return callback(err, null, response)
+
+    callback(null, body)
+  })
+}
+
+Client.prototype.getPromotionCaptcha = function (promotionId, callback) {
+  const self = this
+
+  const path = '/v1/captchas/' + self.state.properties.wallet.paymentId
+  self._retryTrip(self, { path: path, method: 'GET', binaryP: true }, function (err, response, body) {
+    self._log('getPromotionCaptcha', { method: 'GET', path: path, errP: !!err })
     if (err) return callback(err, null, response)
 
     callback(null, body)
@@ -911,7 +956,7 @@ Client.prototype._currentReconcile = function (callback) {
       ]),
         {
           address: self.state.properties.wallet.addresses && self.state.properties.wallet.addresses.BAT
-            ? self.state.properties.wallet.addresses.BAT : self.state.properties.wallet.address,
+                ? self.state.properties.wallet.addresses.BAT : self.state.properties.wallet.address,
           addresses: self.state.properties.wallet.addresses,
           amount: amount,
           currency: currency
@@ -1043,67 +1088,183 @@ Client.prototype._registerViewing = function (viewingId, callback) {
   })
 }
 
-Client.prototype._prepareBallot = function (ballot, transaction, callback) {
+Client.prototype._prepareBatch = function (transaction, callback) {
   const self = this
+  const ballots = self.state.ballots
+  const transactions = self.state.transactions || []
+
+  if (!transaction) {
+    return callback(new Error('_prepareBatch: transaction is null'))
+  }
 
   const credential = new anonize.Credential(transaction.credential)
-  const prefix = self.options.prefix + '/surveyor/voting/'
-  let path
+  const uId = credential.parameters.userId
 
-  path = prefix + encodeURIComponent(ballot.surveyorId) + '/' + credential.parameters.userId
-  self._retryTrip(self, { path: path, method: 'GET', useProxy: true }, function (err, response, body) {
-    let delayTime, now
+  if (!uId) {
+    return callback(new Error('_prepareBatch: uId is empty'))
+  }
 
-    self._log('_prepareBallot', { method: 'GET', path: prefix + '...', errP: !!err })
-    if (err) return callback(transaction.err = err)
+  let path = self.options.prefix + '/batch/surveyor/voting/' + uId
 
-    ballot.prepareBallot = underscore.defaults(body, { server: self.options.server })
+  self._retryTrip(self, { path, method: 'GET', useProxy: true }, function (err, response, body) {
+    self._log('_prepareBatch', { method: 'GET', path, errP: !!err })
+    if (err) return callback(err)
 
-    now = underscore.now()
-    delayTime = random.randomInt({ min: 10 * msecs.second, max: (self.options.debugP ? 1 : 5) * msecs.minute })
-    ballot.delayStamp = now + delayTime
-    if (self.options.verboseP) ballot.delayDate = new Date(ballot.delayStamp)
+    if (!Array.isArray(body)) return callback(new Error('_prepareBatch: Body is not an array'))
 
-    if (delayTime > msecs.minute) delayTime = msecs.minute
-    self._log('_prepareBallot', { delayTime: delayTime })
+    const newBallots = []
+
+    body.forEach(surveyor => {
+      const ballot = ballots.find(ballot => ballot.surveyorId === surveyor.surveyorId)
+      const transaction = transactions.find(transaction => {
+        return transaction.credential && ballot.viewingId === transaction.viewingId
+      })
+
+      if (surveyor.error) {
+        return
+      }
+
+      ballot.prepareBallot = surveyor
+      newBallots.push({
+        ballot,
+        transaction
+      })
+    })
+
+    self._proofBatch(newBallots, callback)
+  })
+}
+
+Client.prototype._proofBatch = function (batch, callback) {
+  const self = this
+  const payload = []
+  const ballots = self.state.ballots
+
+  if (!Array.isArray(batch)) {
+    return callback(new Error('_proofBatch: Batch is not an array'))
+  }
+
+  batch.forEach(item => {
+    const credential = new anonize.Credential(item.transaction.credential)
+    const surveyor = new anonize.Surveyor(item.ballot.prepareBallot)
+    payload.push({
+      credential: JSON.stringify(credential),
+      surveyor: JSON.stringify(surveyor),
+      publisher: item.ballot.publisher
+    })
+  })
+
+  if (payload.length === 0) {
+    return callback(new Error('_proofBatch: payload is empty'))
+  }
+
+  self.credentialSubmit(payload, function (err, result) {
+    if (err) return callback(err)
+
+    if (!Array.isArray(result.payload)) return callback(new Error('_proofBatch: Payload is not an array'))
+
+    result.payload.forEach(item => {
+      const ballot = ballots.find(ballot => ballot.surveyorId === item.surveyorId)
+      ballot.proofBallot = item.proof
+    })
+
+    const delayTime = random.randomInt({ min: 10 * msecs.second, max: 1 * msecs.minute })
+    self._log('_proofBallot', { delayTime: delayTime })
     callback(null, self.state, delayTime)
   })
 }
 
-Client.prototype._commitBallot = function (ballot, transaction, callback) {
+Client.prototype._prepareVoteBatch = function (callback) {
+  let batch = {}
   const self = this
+  const transactions = self.state.transactions
 
-  const credential = new anonize.Credential(transaction.credential)
-  const prefix = self.options.prefix + '/surveyor/voting/'
-  const surveyor = new anonize.Surveyor(ballot.prepareBallot)
-  let path
+  if (!Array.isArray(self.state.ballots)) {
+    return callback(new Error('_prepareVoteBatch: Ballots are not an array'))
+  }
 
-  path = prefix + encodeURIComponent(surveyor.parameters.surveyorId)
+  for (let i = self.state.ballots.length - 1; i >= 0; i--) {
+    const ballot = self.state.ballots[i]
+    let transaction = underscore.find(transactions, function (transaction) {
+      return transaction.credential && ballot.viewingId === transaction.viewingId
+    })
 
-  self.credentialSubmit(credential, surveyor, { publisher: ballot.publisher }, function (err, result) {
-    if (err) return callback(err)
+    if (!transaction) continue
 
-    self._retryTrip(self, { path: path, method: 'PUT', useProxy: true, payload: result.payload }, function (err, response, body) {
+    if (!ballot.prepareBallot || !ballot.proofBallot) {
+      return callback(new Error('_prepareVoteBatch: Ballot is not ready'))
+    }
+
+    if (!transaction.ballots) {
+      transaction.ballots = {}
+    }
+
+    if (!transaction.ballots[ballot.publisher]) {
+      transaction.ballots[ballot.publisher] = 0
+    }
+
+    transaction.ballots[ballot.publisher]++
+
+    if (!batch[ballot.publisher]) batch[ballot.publisher] = []
+
+    batch[ballot.publisher].push({
+      surveyorId: ballot.surveyorId,
+      proof: ballot.proofBallot
+    })
+
+    self.state.ballots.splice(i, 1)
+  }
+
+  self.state.batch = batch
+
+  const delayTime = random.randomInt({ min: 10 * msecs.second, max: 1 * msecs.minute })
+  callback(null, self.state, delayTime)
+}
+
+Client.prototype._voteBatch = function (callback) {
+  const self = this
+  if (!self.state.batch) {
+    return callback(new Error('No batch data'))
+  }
+
+  const path = self.options.prefix + '/batch/surveyor/voting'
+
+  const keys = Object.keys(self.state.batch) || []
+  if (keys.length === 0) {
+    return callback(new Error('No batch data (keys are empty'))
+  }
+
+  const publisher = self.state.batch[keys[0]]
+  let payload
+
+  if (publisher.length > BATCH_SIZE) {
+    payload = publisher.splice(0, BATCH_SIZE)
+  } else {
+    payload = publisher
+  }
+
+  self._retryTrip(self, { path: path, method: 'POST', useProxy: true, payload: payload }, function (err, response, body) {
+    self._log('_voteBatch', { method: 'POST', path: path + '...', errP: !!err })
+    // TODO add error to the specific transaction
+    if (err || !body) return callback(err)
+
+    body.forEach((vote) => {
       let i
+      for (i = publisher.length - 1; i >= 0; i--) {
+        if (publisher[i].surveyorId !== vote.surveyorId) continue
 
-      self._log('_commitBallot', { method: 'PUT', path: prefix + '...', errP: !!err })
-      if (err) return callback(transaction.err = err)
-
-      if (!transaction.ballots) transaction.ballots = {}
-      if (!transaction.ballots[ballot.publisher]) transaction.ballots[ballot.publisher] = 0
-      transaction.ballots[ballot.publisher]++
-
-      for (i = self.state.ballots.length - 1; i >= 0; i--) {
-        if (self.state.ballots[i].surveyorId !== ballot.surveyorId) continue
-
-        self.state.ballots.splice(i, 1)
+        publisher.splice(i, 1)
         break
       }
-      if (i < 0) console.log('\n\nunable to find ballot surveyorId=' + ballot.surveyorId)
-
-      self._log('_commitBallot', { delayTime: msecs.minute })
-      callback(null, self.state, msecs.minute)
     })
+
+    if (self.state.batch[keys[0]].length === 0) {
+      delete self.state.batch[keys[0]]
+    }
+
+    const delayTime = random.randomInt({ min: 10 * msecs.second, max: 1 * msecs.minute })
+    self._log('_voteBatch', { delayTime: delayTime })
+    callback(null, self.state, delayTime)
   })
 }
 
@@ -1234,7 +1395,7 @@ Client.prototype._roundTrip = function (params, callback) {
 
   params = underscore.extend(underscore.pick(self.options.server, [ 'protocol', 'hostname', 'port' ]), params)
   params.headers = underscore.defaults(params.headers || {},
-                                       { 'content-type': 'application/json; charset=utf-8', 'accept-encoding': '' })
+      { 'content-type': 'application/json; charset=utf-8', 'accept-encoding': '' })
 
   request = client.request(underscore.omit(params, [ 'useProxy', 'payload' ]), function (response) {
     let body = ''
@@ -1250,7 +1411,7 @@ Client.prototype._roundTrip = function (params, callback) {
       if (self.options.verboseP) {
         console.log('[ response for ' + params.method + ' ' + server.protocol + '//' + server.hostname + params.path + ' ]')
         console.log('>>> HTTP/' + response.httpVersionMajor + '.' + response.httpVersionMinor + ' ' + response.statusCode +
-                   ' ' + (response.statusMessage || ''))
+            ' ' + (response.statusMessage || ''))
         underscore.keys(response.headers).forEach(function (header) {
           console.log('>>> ' + header + ': ' + response.headers[header])
         })
@@ -1325,21 +1486,10 @@ Client.prototype.credentialWorker = function (operation, payload, callback) {
   worker.start()
 }
 
-Client.prototype.credentialRoundTrip = function (operation, payload, callback) {
-  const msgno = this.seqno++
-  const request = { msgno: msgno, operation: operation, payload: payload }
-
-  this.callbacks[msgno] = { verboseP: this.options.verboseP, callback: callback }
-  if (this.options.verboseP) console.log('! <<< ' + JSON.stringify(request, null, 2))
-  this.helper.send(request)
-}
-
 Client.prototype.credentialRequest = function (credential, callback) {
   let proof
 
   if (this.options.createWorker) return this.credentialWorker('request', { credential: JSON.stringify(credential) }, callback)
-
-  if (this.helper) this.credentialRoundTrip('request', { credential: JSON.stringify(credential) }, callback)
 
   try { proof = credential.request() } catch (ex) { return callback(ex) }
   callback(null, { proof: proof })
@@ -1350,32 +1500,30 @@ Client.prototype.credentialFinalize = function (credential, verification, callba
     return this.credentialWorker('finalize', { credential: JSON.stringify(credential), verification: verification }, callback)
   }
 
-  if (this.helper) {
-    return this.credentialRoundTrip('finalize', { credential: JSON.stringify(credential), verification: verification },
-                                    callback)
-  }
-
   try { credential.finalize(verification) } catch (ex) { return callback(ex) }
   callback(null, { credential: JSON.stringify(credential) })
 }
 
-Client.prototype.credentialSubmit = function (credential, surveyor, data, callback) {
-  let payload
-
+Client.prototype.credentialSubmit = function (ballots, callback) {
   if (this.options.createWorker) {
-    return this.credentialWorker('submit',
-                                 { credential: JSON.stringify(credential), surveyor: JSON.stringify(surveyor), data: data },
-                                 callback)
+    return this.credentialWorker('submit', { ballots, multiple: true }, callback)
   }
 
-  if (this.helper) {
-    return this.credentialRoundTrip('submit',
-                                    { credential: JSON.stringify(credential), surveyor: JSON.stringify(surveyor), data: data },
-                                    callback)
-  }
+  try {
+    let payload = []
+    ballots.forEach(ballot => {
+      const credential = new anonize.Credential(ballot.credential)
+      const surveyor = new anonize.Surveyor(ballot.surveyor)
 
-  try { payload = { proof: credential.submit(surveyor, data) } } catch (ex) { return callback(ex) }
-  return callback(null, { payload: payload })
+      payload.push({
+        surveyorId: surveyor.parameters.surveyorId,
+        proof: credential.submit(surveyor, { publisher: ballot.publisher })
+      })
+    })
+    return callback(null, { payload })
+  } catch (ex) {
+    return callback(ex)
+  }
 }
 
 Client.prototype._fuzzing = function (synopsis, callback) {
@@ -1388,7 +1536,7 @@ Client.prototype._fuzzing = function (synopsis, callback) {
       (this.options && this.options.noFuzzing) ||
       (this.boolion(process.env.LEDGER_NO_FUZZING))) return
 
-  synopsis.prune()
+  const pruned = synopsis.prune()
   underscore.keys(synopsis.publishers).forEach((publisher) => {
     duration += synopsis.publishers[publisher].duration
   })
@@ -1398,14 +1546,21 @@ Client.prototype._fuzzing = function (synopsis, callback) {
   memo = { duration: duration, ratio1: ratio, numFrames: synopsis.options.numFrames, frameSize: synopsis.options.frameSize }
   window = synopsis.options.numFrames * synopsis.options.frameSize
   if (window > 0) ratio *= (30 * msecs.day) / window
-  if (ratio >= 1.0) return
+  if (ratio >= 1.0) {
+    if (pruned && callback) {
+      callback(null, pruned)
+    }
+    return
+  }
 
   memo.window = window
   memo.ratio2 = ratio
 
-  advance = Math.round((this.state.properties.days * msecs.day) * (1.0 - ratio))
+  const totalDays = this.state.properties.days * msecs.day
+
+  advance = totalDays - Math.round(totalDays * (1.0 - ratio))
   memo.advance1 = advance
-  if (advance > (2 * msecs.day)) advance = 2 * msecs.day
+  if (advance > (2 * msecs.day) || advance <= 0) advance = 2 * msecs.day
   memo.advance2 = advance
   if (advance) {
     this.state.reconcileStamp = underscore.now() + 3 * msecs.day + advance
@@ -1414,7 +1569,7 @@ Client.prototype._fuzzing = function (synopsis, callback) {
   memo.reconcileDate = new Date(memo.reconcileStamp)
 
   if (callback) {
-    callback(advance)
+    callback(advance, pruned)
   }
 
   this.memo('_fuzzing', memo)
